@@ -1,4 +1,4 @@
-use libsql_client::{args, Client, ResultSet, Statement};
+use libsql::{params, Database, DbConnection, Rows};
 use std::collections::HashMap;
 use worker::*;
 
@@ -15,15 +15,18 @@ fn log_request(req: &Request) {
 }
 
 // Take a query result and render it into a HTML table
-fn result_to_html_table(result: ResultSet) -> String {
+fn result_to_html_table(mut result: Rows) -> String {
     let mut html = "<table style=\"border: 1px solid\">".to_string();
-    for column in result.columns {
+    let col_num = result.column_count();
+    for col in 0..col_num {
+        let column = result.column_name(col).unwrap_or("");
         html += &format!("<th style=\"border: 1px solid\">{column}</th>");
     }
-    for row in result.rows {
+    for row in result.next().unwrap() {
         html += "<tr style=\"border: 1px solid\">";
-        for cell in row.values {
-            html += &format!("<td>{cell}</td>");
+        for col in 0..col_num {
+            let cell = row.get_value(col).unwrap();
+            html += &format!("<td>{cell:?}</td>");
         }
         html += "</tr>";
     }
@@ -32,7 +35,7 @@ fn result_to_html_table(result: ResultSet) -> String {
 }
 
 // Create a javascript canvas which loads a map of visited airports
-fn create_map_canvas(result: ResultSet) -> String {
+fn create_map_canvas(mut result: Rows) -> String {
     let mut canvas = r#"
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/0.5.16/p5.min.js" type="text/javascript"></script>
   <script src="https://unpkg.com/mappa-mundi/dist/mappa.js" type="text/javascript"></script>
@@ -63,11 +66,14 @@ fn create_map_canvas(result: ResultSet) -> String {
       clear();
       let point;"#.to_owned();
 
-    for row in result.rows {
+    for row in result.next().unwrap() {
+        let airport = row.get_str(0).unwrap();
+        let lat: f64 = row.get(1).unwrap();
+        let lon: f64 = row.get(2).unwrap();
         canvas += &format!(
             "point = myMap.latLngToPixel({}, {});\nellipse(point.x, point.y, 10, 10);\ntext({}, point.x, point.y);\n",
             // NOTICE: value_map is not very efficient and only enabled if the feature "mapping_names_to_values_in_rows" is enabled
-            row.value_map["lat"], row.value_map["long"], row.value_map["airport"]
+            lat, lon, airport
         );
     }
     canvas += "}</script>";
@@ -80,46 +86,46 @@ async fn serve(
     country: impl Into<String>,
     city: impl Into<String>,
     coordinates: (f32, f32),
-    db: &libsql_client::Client,
+    db: &DbConnection,
 ) -> anyhow::Result<String> {
     let airport = airport.into();
     let country = country.into();
     let city = city.into();
 
     // Recreate the tables if they do not exist yet
-    if let Err(e) = db.execute("CREATE TABLE IF NOT EXISTS counter(country TEXT, city TEXT, value, PRIMARY KEY(country, city)) WITHOUT ROWID")
+    if let Err(e) = db.execute("CREATE TABLE IF NOT EXISTS counter(country TEXT, city TEXT, value, PRIMARY KEY(country, city)) WITHOUT ROWID", ())
     .await {
         tracing::error!("Error creating table: {e}");
         anyhow::bail!("{e}")
     };
     if let Err(e) = db.execute(
-        "CREATE TABLE IF NOT EXISTS coordinates(lat INT, long INT, airport TEXT, PRIMARY KEY (lat, long))",
+        "CREATE TABLE IF NOT EXISTS coordinates(lat INT, long INT, airport TEXT, PRIMARY KEY (lat, long))", ()
     )
     .await {
         tracing::error!("Error creating table: {e}");
         anyhow::bail!("{e}")
     };
-    db.batch([
-        Statement::with_args(
-            "INSERT OR IGNORE INTO counter VALUES (?, ?, 0)",
-            &[&country, &city],
-        ),
-        Statement::with_args(
-            "UPDATE counter SET value = value + 1 WHERE country = ? AND city = ?",
-            &[country, city],
-        ),
-        Statement::with_args(
-            "INSERT OR IGNORE INTO coordinates VALUES (?, ?, ?)",
-            // Parameters with different types can be passed to a convenience macro - args!()
-            args!(coordinates.0, coordinates.1, airport),
-        ),
-    ])
+    db.execute(
+        "INSERT OR IGNORE INTO counter VALUES (?, ?, 0)",
+        params![country.clone(), city.clone()],
+    )
     .await?;
-    let counter_response = db.execute("SELECT * FROM counter").await?;
+    db.execute(
+        "UPDATE counter SET value = value + 1 WHERE country = ? AND city = ?",
+        params![country, city],
+    )
+    .await?;
+    db.execute(
+        "INSERT OR IGNORE INTO coordinates VALUES (?, ?, ?)",
+        // Parameters with different types can be passed to a convenience macro - args!()
+        params![coordinates.0, coordinates.1, airport],
+    )
+    .await?;
+    let counter_response = db.query("SELECT * FROM counter", ()).await?;
     let scoreboard = result_to_html_table(counter_response);
 
     let canvas = create_map_canvas(
-        db.execute("SELECT airport, lat, long FROM coordinates")
+        db.query("SELECT airport, lat, long FROM coordinates")
             .await?,
     );
     let html = format!(
@@ -145,7 +151,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
     router
         .get_async("/", |req, ctx| async move {
-            let db = match Client::from_workers_env(&ctx.env) {
+            let db = match Database::from_workers_env(&ctx.env) {
                 Ok(db) => db,
                 Err(e) => {
                     tracing::error!("Error {e}");
@@ -178,7 +184,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             ))
         })
         .get_async("/users", |_, ctx| async move {
-            let client = match Client::from_workers_env(&ctx.env) {
+            let client = match Database::from_workers_env(&ctx.env) {
                 Ok(client) => client,
                 Err(e) => return Response::error(e.to_string(), 500),
             };
@@ -199,7 +205,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 None => return Response::error("No email", 400),
             };
 
-            let client = match Client::from_workers_env(&ctx.env) {
+            let client = match Database::from_workers_env(&ctx.env) {
                 Ok(client) => client,
                 Err(e) => return Response::error(e.to_string(), 500),
             };
@@ -218,8 +224,9 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
 #[cfg(test)]
 mod tests {
-    use libsql_client::{DatabaseClient, ResultSet, Value};
-    fn test_db() -> libsql_client::local::Client {
+    use libsql::{DbConnection, Rows, Value};
+
+    fn test_db() -> DbConnection {
         libsql_client::local::Client::in_memory().unwrap()
     }
 
@@ -239,7 +246,7 @@ mod tests {
             super::serve(p.0, p.1, p.2, p.3, &db).await.unwrap();
         }
 
-        let ResultSet { columns, rows } = db
+        let result = db
             .execute("SELECT country, city, value FROM counter")
             .await
             .unwrap()
