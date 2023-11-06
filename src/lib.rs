@@ -1,4 +1,4 @@
-use libsql::{params, Database, DbConnection, Rows};
+use libsql_remote::{params, DbConnection, Rows};
 use std::collections::HashMap;
 use worker::*;
 
@@ -17,16 +17,16 @@ fn log_request(req: &Request) {
 // Take a query result and render it into a HTML table
 fn result_to_html_table(mut result: Rows) -> String {
     let mut html = "<table style=\"border: 1px solid\">".to_string();
-    let col_num = result.column_count();
+    let col_num = result.columns().len();
     for col in 0..col_num {
         let column = result.column_name(col).unwrap_or("");
         html += &format!("<th style=\"border: 1px solid\">{column}</th>");
     }
-    for row in result.next().unwrap() {
+    while let Some(row) = result.next() {
         html += "<tr style=\"border: 1px solid\">";
         for col in 0..col_num {
             let cell = row.get_value(col).unwrap();
-            html += &format!("<td>{cell:?}</td>");
+            html += &format!("<td>{cell}</td>");
         }
         html += "</tr>";
     }
@@ -66,8 +66,8 @@ fn create_map_canvas(mut result: Rows) -> String {
       clear();
       let point;"#.to_owned();
 
-    for row in result.next().unwrap() {
-        let airport = row.get_str(0).unwrap();
+    while let Some(row) = result.next() {
+        let airport: String = row.get(0).unwrap();
         let lat: f64 = row.get(1).unwrap();
         let lon: f64 = row.get(2).unwrap();
         canvas += &format!(
@@ -125,7 +125,7 @@ async fn serve(
     let scoreboard = result_to_html_table(counter_response);
 
     let canvas = create_map_canvas(
-        db.query("SELECT airport, lat, long FROM coordinates")
+        db.query("SELECT airport, lat, long FROM coordinates", ())
             .await?,
     );
     let html = format!(
@@ -140,6 +140,18 @@ async fn serve(
     Ok(html)
 }
 
+fn open_connection(env: &Env) -> anyhow::Result<DbConnection> {
+    let url = env
+        .secret("LIBSQL_CLIENT_URL")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .to_string();
+    let token = env
+        .secret("LIBSQL_CLIENT_TOKEN")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .to_string();
+    Ok(DbConnection::open(url, token))
+}
+
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     log_request(&req);
@@ -151,12 +163,9 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
     router
         .get_async("/", |req, ctx| async move {
-            let db = match Database::from_workers_env(&ctx.env) {
-                Ok(db) => db,
-                Err(e) => {
-                    tracing::error!("Error {e}");
-                    return Response::from_html(format!("Error establishing connection: {e}"));
-                }
+            let db = match open_connection(&ctx.env) {
+                Ok(client) => client,
+                Err(e) => return Response::error(e.to_string(), 500),
             };
             let cf = req.cf();
             let airport = cf.colo();
@@ -184,18 +193,16 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             ))
         })
         .get_async("/users", |_, ctx| async move {
-            let client = match Database::from_workers_env(&ctx.env) {
+            let db = match open_connection(&ctx.env) {
                 Ok(client) => client,
                 Err(e) => return Response::error(e.to_string(), 500),
             };
-
             let stmt = "select * from example_users";
-            let rs = match client.execute(stmt).await {
-                Ok(rs) => rs,
+            let rows = match db.query(stmt, ()).await {
+                Ok(rows) => rows,
                 Err(e) => return Response::error(e.to_string(), 500),
             };
-
-            Response::from_json(&serde_json::json!(rs))
+            Response::from_json(&rows)
         })
         .get_async("/add-user", |req, ctx| async move {
             let url = req.url().unwrap();
@@ -205,13 +212,18 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 None => return Response::error("No email", 400),
             };
 
-            let client = match Database::from_workers_env(&ctx.env) {
+            let db = match open_connection(&ctx.env) {
                 Ok(client) => client,
                 Err(e) => return Response::error(e.to_string(), 500),
             };
 
-            let stmt = Statement::with_args("insert into example_users values (?)", args!(email));
-            match client.execute(stmt).await {
+            match db
+                .execute(
+                    "insert into example_users values (?)",
+                    params![email.clone()],
+                )
+                .await
+            {
                 Ok(_) => Response::from_json(&serde_json::json!({
                     "result": "Added"
                 })),
@@ -221,13 +233,46 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         .run(req, env)
         .await
 }
+/*
+pub struct RowsExt(Rows);
+
+impl Into<serde_json::Value> for RowsExt {
+    fn into(mut self) -> Value {
+        let cols = self.0.column_count();
+        let mut res: Vec<Vec<serde_json::Value>> = vec![];
+        let mut columns = Vec::with_capacity(cols as usize);
+        for i in 0..cols {
+            columns.push(self.0.column_name(i).into());
+        }
+        res.push(columns);
+        while let Some(row) = self.0.next().unwrap() {
+            let mut r = Vec::with_capacity(cols as usize);
+            for i in 0..cols {
+                let json = match row.get_value(i).unwrap() {
+                    libsql_remote::Value::Null => Value::Null,
+                    libsql_remote::Value::Integer(v) => Value::from(v),
+                    libsql_remote::Value::Float(v) => Value::from(v),
+                    libsql_remote::Value::Text(v) => Value::String(v),
+                    libsql_remote::Value::Blob(blob) => Value::String(simple_base64::encode(&blob)),
+                };
+                r.push(json);
+            }
+            res.push(r);
+        }
+        res.into()
+    }
+}
+
+ */
 
 #[cfg(test)]
 mod tests {
-    use libsql::{DbConnection, Rows, Value};
+    use libsql_remote::DbConnection;
 
     fn test_db() -> DbConnection {
-        libsql_client::local::Client::in_memory().unwrap()
+        let url = env!("LIBSQL_CLIENT_URL");
+        let auth_token = env!("LIBSQL_CLIENT_TOKEN");
+        DbConnection::open(url, auth_token)
     }
 
     #[tokio::test]
@@ -246,23 +291,22 @@ mod tests {
             super::serve(p.0, p.1, p.2, p.3, &db).await.unwrap();
         }
 
-        let result = db
-            .execute("SELECT country, city, value FROM counter")
+        let mut result = db
+            .query("SELECT country, city, value FROM counter", ())
             .await
-            .unwrap()
-            .into_result_set()
             .unwrap();
+        let columns: Vec<_> = result
+            .columns()
+            .map(|c| c.name.as_deref().unwrap_or(""))
+            .collect();
 
         assert_eq!(columns, vec!["country", "city", "value"]);
-        for row in rows {
-            let city = match &row.cells["city"] {
-                Value::Text(c) => c.as_str(),
-                _ => panic!("Invalid entry for a city: {:?}", row),
-            };
-            match city {
-                "Warsaw" => assert_eq!(row.cells["value"], 3.into()),
-                "Helsinki" => assert_eq!(row.cells["value"], 2.into()),
-                _ => panic!("Unknown city: {:?}", row),
+        while let Some(row) = result.next() {
+            let city: String = row.get(1).unwrap();
+            match city.as_str() {
+                "Warsaw" => assert_eq!(row.get::<i64>(2).unwrap(), 3),
+                "Helsinki" => assert_eq!(row.get::<i64>(2).unwrap(), 2),
+                other => panic!("Unknown city: {:?}", other),
             }
         }
     }

@@ -4,6 +4,8 @@ compatibility_date = "2022-01-20"
 
 [vars]
 WORKERS_RS_VERSION = "0.0.12"
+LIBSQL_CLIENT_URL = ""
+LIBSQL_CLIENT_TOKEN = ""
 
 [build]
 command = "cargo install -q worker-build --version 0.0.10 && worker-build --release"
