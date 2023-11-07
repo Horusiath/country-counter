@@ -4,8 +4,8 @@ compatibility_date = "2022-01-20"
 
 [vars]
 WORKERS_RS_VERSION = "0.0.12"
-LIBSQL_CLIENT_URL = ""
-LIBSQL_CLIENT_TOKEN = ""
+LIBSQL_CLIENT_URL = "libsql://test1-horusiath.turso.io"
+LIBSQL_CLIENT_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpYXQiOiIyMDIzLTExLTA3VDAxOjI4OjE1LjgwMDkzOTg3MVoiLCJpZCI6ImM4ZTBmMWVjLTc3OTItMTFlZS05MTI3LTU2Mjc5ZGZlNDJmMyJ9.TyGgDbWs9JHEQu9l4do3qAuxzyaWmVW7FOVVw1Vki8GLxAGDoGrnkuHnPtnE9dOFOw8KG6IKsDM8TIULAIQlBA"
 
 [build]
 command = "cargo install -q worker-build --version 0.0.10 && worker-build --release"

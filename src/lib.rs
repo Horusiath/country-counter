@@ -1,4 +1,7 @@
-use libsql_remote::{params, DbConnection, Rows};
+use libsql::{params, DbConnection, Rows, Value};
+use serde_json::json;
+use simple_base64::prelude::BASE64_STANDARD_NO_PAD;
+use simple_base64::Engine;
 use std::collections::HashMap;
 use worker::*;
 
@@ -17,21 +20,31 @@ fn log_request(req: &Request) {
 // Take a query result and render it into a HTML table
 fn result_to_html_table(mut result: Rows) -> String {
     let mut html = "<table style=\"border: 1px solid\">".to_string();
-    let col_num = result.columns().len();
+    let col_num = result.column_count();
     for col in 0..col_num {
         let column = result.column_name(col).unwrap_or("");
         html += &format!("<th style=\"border: 1px solid\">{column}</th>");
     }
-    while let Some(row) = result.next() {
+    while let Some(row) = result.next().unwrap() {
         html += "<tr style=\"border: 1px solid\">";
         for col in 0..col_num {
             let cell = row.get_value(col).unwrap();
-            html += &format!("<td>{cell}</td>");
+            html += &format!("<td>{}</td>", stringify(&cell));
         }
         html += "</tr>";
     }
     html += "</table>";
     html
+}
+
+fn stringify(cell: &Value) -> String {
+    match cell {
+        Value::Null => "".to_string(),
+        Value::Integer(v) => v.to_string(),
+        Value::Real(v) => v.to_string(),
+        Value::Text(v) => v.clone(),
+        Value::Blob(v) => BASE64_STANDARD_NO_PAD.encode(&v),
+    }
 }
 
 // Create a javascript canvas which loads a map of visited airports
@@ -66,7 +79,7 @@ fn create_map_canvas(mut result: Rows) -> String {
       clear();
       let point;"#.to_owned();
 
-    while let Some(row) = result.next() {
+    while let Some(row) = result.next().unwrap() {
         let airport: String = row.get(0).unwrap();
         let lat: f64 = row.get(1).unwrap();
         let lon: f64 = row.get(2).unwrap();
@@ -202,7 +215,11 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 Ok(rows) => rows,
                 Err(e) => return Response::error(e.to_string(), 500),
             };
-            Response::from_json(&rows)
+            let json = match into_json(rows) {
+                Ok(json) => json,
+                Err(e) => return Response::error(e.to_string(), 500),
+            };
+            Response::from_json(&json)
         })
         .get_async("/add-user", |req, ctx| async move {
             let url = req.url().unwrap();
@@ -233,41 +250,38 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         .run(req, env)
         .await
 }
-/*
-pub struct RowsExt(Rows);
 
-impl Into<serde_json::Value> for RowsExt {
-    fn into(mut self) -> Value {
-        let cols = self.0.column_count();
-        let mut res: Vec<Vec<serde_json::Value>> = vec![];
-        let mut columns = Vec::with_capacity(cols as usize);
-        for i in 0..cols {
-            columns.push(self.0.column_name(i).into());
-        }
-        res.push(columns);
-        while let Some(row) = self.0.next().unwrap() {
-            let mut r = Vec::with_capacity(cols as usize);
-            for i in 0..cols {
-                let json = match row.get_value(i).unwrap() {
-                    libsql_remote::Value::Null => Value::Null,
-                    libsql_remote::Value::Integer(v) => Value::from(v),
-                    libsql_remote::Value::Float(v) => Value::from(v),
-                    libsql_remote::Value::Text(v) => Value::String(v),
-                    libsql_remote::Value::Blob(blob) => Value::String(simple_base64::encode(&blob)),
-                };
-                r.push(json);
-            }
-            res.push(r);
-        }
-        res.into()
+fn into_json(mut res: Rows) -> anyhow::Result<serde_json::Value> {
+    let col_num = res.column_count();
+    let cols: Vec<_> = (0..col_num)
+        .map(|i| res.column_name(i).map(String::from))
+        .collect();
+    let mut rows = Vec::new();
+    while let Some(row) = res.next()? {
+        let r: Vec<_> = (0..col_num)
+            .map(|i| match row.get_value(i).unwrap() {
+                Value::Null => serde_json::Value::Null,
+                Value::Integer(v) => serde_json::Value::from(v),
+                Value::Real(v) => serde_json::Value::from(v),
+                Value::Text(v) => serde_json::Value::from(v),
+                Value::Blob(v) => {
+                    let b = BASE64_STANDARD_NO_PAD.encode(&v);
+                    json!({ "base64": b })
+                }
+            })
+            .collect();
+        rows.push(r);
     }
-}
 
- */
+    Ok(json!({
+        "columns": cols,
+        "rows": rows
+    }))
+}
 
 #[cfg(test)]
 mod tests {
-    use libsql_remote::DbConnection;
+    use libsql::DbConnection;
 
     fn test_db() -> DbConnection {
         let url = env!("LIBSQL_CLIENT_URL");
@@ -295,13 +309,12 @@ mod tests {
             .query("SELECT country, city, value FROM counter", ())
             .await
             .unwrap();
-        let columns: Vec<_> = result
-            .columns()
-            .map(|c| c.name.as_deref().unwrap_or(""))
+        let columns: Vec<_> = (0..result.column_count())
+            .map(|c| result.column_name(c).unwrap_or(""))
             .collect();
 
         assert_eq!(columns, vec!["country", "city", "value"]);
-        while let Some(row) = result.next() {
+        while let Some(row) = result.next().unwrap() {
             let city: String = row.get(1).unwrap();
             match city.as_str() {
                 "Warsaw" => assert_eq!(row.get::<i64>(2).unwrap(), 3),
