@@ -11,7 +11,7 @@ default = ["console_error_panic_hook"]
 
 [dependencies]
 cfg-if = "0.1.2"
-libsql = { version = "0.1", path ="../libsql/libsql", default-features = false, features = ["cloudflare"] }
+libsql = { version = "0.1", path ="../libsql/libsql", default-features = false, features = ["wasm", "cloudflare"] }
 worker = "0.0.18"
 simple-base64 = "0.23.2"
 

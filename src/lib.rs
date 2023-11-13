@@ -1,4 +1,5 @@
-use libsql::{params, DbConnection, Rows, Value};
+use libsql::wasm::{CloudflareSender, Connection};
+use libsql::{params, Rows, Value};
 use serde_json::json;
 use simple_base64::prelude::BASE64_STANDARD_NO_PAD;
 use simple_base64::Engine;
@@ -99,25 +100,23 @@ async fn serve(
     country: impl Into<String>,
     city: impl Into<String>,
     coordinates: (f32, f32),
-    db: &DbConnection,
+    db: &Connection<CloudflareSender>,
 ) -> anyhow::Result<String> {
     let airport = airport.into();
     let country = country.into();
     let city = city.into();
 
     // Recreate the tables if they do not exist yet
-    if let Err(e) = db.execute("CREATE TABLE IF NOT EXISTS counter(country TEXT, city TEXT, value, PRIMARY KEY(country, city)) WITHOUT ROWID", ())
-    .await {
+
+    if let Err(e) = db.execute_batch(r#"
+    BEGIN;
+        CREATE TABLE IF NOT EXISTS counter(country TEXT, city TEXT, value, PRIMARY KEY(country, city)) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS coordinates(lat INT, long INT, airport TEXT, PRIMARY KEY (lat, long));
+    END;
+    "#).await {
         tracing::error!("Error creating table: {e}");
         anyhow::bail!("{e}")
-    };
-    if let Err(e) = db.execute(
-        "CREATE TABLE IF NOT EXISTS coordinates(lat INT, long INT, airport TEXT, PRIMARY KEY (lat, long))", ()
-    )
-    .await {
-        tracing::error!("Error creating table: {e}");
-        anyhow::bail!("{e}")
-    };
+    }
     db.execute(
         "INSERT OR IGNORE INTO counter VALUES (?, ?, 0)",
         params![country.clone(), city.clone()],
@@ -153,7 +152,7 @@ async fn serve(
     Ok(html)
 }
 
-fn open_connection(env: &Env) -> anyhow::Result<DbConnection> {
+fn open_connection(env: &Env) -> anyhow::Result<Connection<CloudflareSender>> {
     let url = env
         .secret("LIBSQL_CLIENT_URL")
         .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -162,7 +161,7 @@ fn open_connection(env: &Env) -> anyhow::Result<DbConnection> {
         .secret("LIBSQL_CLIENT_TOKEN")
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .to_string();
-    Ok(DbConnection::open(url, token))
+    Ok(Connection::open_cloudflare_worker(url, token))
 }
 
 #[event(fetch)]
@@ -281,12 +280,12 @@ fn into_json(mut res: Rows) -> anyhow::Result<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use libsql::DbConnection;
+    use libsql::wasm::{CloudflareSender, Connection};
 
-    fn test_db() -> DbConnection {
+    fn test_db() -> Connection<CloudflareSender> {
         let url = env!("LIBSQL_CLIENT_URL");
         let auth_token = env!("LIBSQL_CLIENT_TOKEN");
-        DbConnection::open(url, auth_token)
+        Connection::open_cloudflare_worker(url, auth_token)
     }
 
     #[tokio::test]
